@@ -520,6 +520,7 @@ class Darknet(nn.Module):
             else:  # run module directly, i.e. mtype = 'convolutional', 'upsample', 'maxpool', 'batchnorm2d' etc.
                 #print(module)
                 #print(x.shape)
+                x = x.contiguous()
                 x = module(x)
 
             out.append(x if self.routs[i] else [])

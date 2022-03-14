@@ -45,31 +45,25 @@ def test(data,
          plots=True,
          log_imgs=0):  # number of logged images
 
-    # Initialize/load model and set device
-    training = model is not None
-    if training:  # called by train.py
-        device = next(model.parameters()).device  # get model device
+    set_logging()
+    device = select_device(opt.device, batch_size=batch_size)
+    save_txt = opt.save_txt  # save *.txt labels
 
-    else:  # called directly
-        set_logging()
-        device = select_device(opt.device, batch_size=batch_size)
-        save_txt = opt.save_txt  # save *.txt labels
+    # Directories
+    save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # increment run
+    (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
-        # Directories
-        save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # increment run
-        (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+    # Load model
+    model = Darknet(opt.cfg).to(device)
 
-        # Load model
-        model = Darknet(opt.cfg).to(device)
-
-        # load model
-        try:
-            ckpt = torch.load(weights[0], map_location=device)  # load checkpoint
-            ckpt['model'] = {k: v for k, v in ckpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
-            model.load_state_dict(ckpt['model'], strict=False)
-        except:
-            load_darknet_weights(model, weights[0])
-        imgsz = check_img_size(imgsz, s=64)  # check img_size
+    # load model
+    try:
+        ckpt = torch.load(weights[0], map_location=device)  # load checkpoint
+        ckpt['model'] = {k: v for k, v in ckpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
+        model.load_state_dict(ckpt['model'], strict=False)
+    except:
+        load_darknet_weights(model, weights[0])
+    imgsz = check_img_size(imgsz, s=64)  # check img_size
 
     # Half
     half = device.type != 'cpu'  # half precision only supported on CUDA
@@ -95,11 +89,11 @@ def test(data,
         log_imgs = 0
 
     # Dataloader
-    if not training:
-        img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
-        _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
-        path = data['test'] if opt.task == 'test' else data['val']  # path to val/test images
-        dataloader = create_dataloader(path, imgsz, batch_size, 64, opt, pad=0.5, rect=True)[0]
+
+    img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
+    _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
+    path = data['test'] if opt.task == 'test' else data['val']  # path to val/test images
+    dataloader = create_dataloader(path, imgsz, batch_size, 64, opt, pad=0.5, rect=True)[0]
 
     seen = 0
     try:
@@ -111,6 +105,8 @@ def test(data,
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
+
+    out_boxes = {}
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
         img = img.half() if half else img.float()  # uint8 to fp16/32
@@ -127,8 +123,8 @@ def test(data,
             t0 += time_synchronized() - t
 
             # Compute loss
-            if training:  # if model has loss hyperparameters
-                loss += compute_loss([x.float() for x in train_out], targets, model)[1][:3]  # box, obj, cls
+            # if training:  # if model has loss hyperparameters
+            #     loss += compute_loss([x.float() for x in train_out], targets, model)[1][:3]  # box, obj, cls
 
             # Run NMS
             t = time_synchronized()
@@ -149,16 +145,39 @@ def test(data,
 
             # Append to text file
             path = Path(paths[si])
-            if save_txt:
-                gn = torch.tensor(shapes[si][0])[[1, 0, 1, 0]]  # normalization gain whwh
-                x = pred.clone()
-                x[:, :4] = scale_coords(img[si].shape[1:], x[:, :4], shapes[si][0], shapes[si][1])  # to original
-                for *xyxy, conf, cls in x:
-                    xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                    line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
-                    with open(save_dir / 'labels' / (path.stem + '.txt'), 'a') as f:
-                        f.write(('%g ' * len(line)).rstrip() % line + '\n')
+            gn = torch.tensor(shapes[si][0])[[1, 0, 1, 0]]  # normalization gain whwh
+            x = pred.clone()
+            x[:, :4] = scale_coords(img[si].shape[1:], x[:, :4], shapes[si][0], shapes[si][1])  # to original
 
+            boxes = []
+            labels = []
+            scores = []
+            path = Path(path)
+            img_name = path.stem
+            for *xyxy, conf, cls in x:
+                if conf.item() < opt.conf_thres:
+                    continue
+                boxes.append([coord.item() for coord in xyxy])
+                labels.append(names[int(cls)])
+                scores.append(conf.item())
+            if not labels or not boxes or not scores:
+                continue
+            out_boxes[img_name] = {}
+            out_boxes[img_name]['labels'] = labels
+            out_boxes[img_name]['boxes'] = boxes
+            out_boxes[img_name]['scores'] = scores
+
+
+            
+                # xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                # line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+                # with open(save_dir / 'labels' / (path.stem + '.txt'), 'a') as f:
+                #     f.write(('%g ' * len(line)).rstrip() % line + '\n')
+
+            # out_boxes[img_name] = {}
+            # out_boxes[img_name]['labels'] = [cl_idx for cl_idx in labels.tolist()]
+            # out_boxes[img_name]['boxes'] = boxes.tolist()
+            # out_boxes[img_name]['scores'] = confidence.tolist()
             # W&B logging
             if plots and len(wandb_images) < log_imgs:
                 box_data = [{"position": {"minX": xyxy[0], "minY": xyxy[1], "maxX": xyxy[2], "maxY": xyxy[3]},
@@ -187,44 +206,46 @@ def test(data,
                                   'score': round(p[4], 5)})
 
             # Assign all predictions as incorrect
-            correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
-            if nl:
-                detected = []  # target indices
-                tcls_tensor = labels[:, 0]
+            # correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
+            # if nl:
+            #     detected = []  # target indices
+            #     tcls_tensor = labels[:, 0]
 
-                # target boxes
-                tbox = xywh2xyxy(labels[:, 1:5]) * whwh
+            #     # target boxes
+            #     tbox = xywh2xyxy(labels[:, 1:5]) * whwh
 
-                # Per target class
-                for cls in torch.unique(tcls_tensor):
-                    ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
-                    pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
+            #     # Per target class
+            #     for cls in torch.unique(tcls_tensor):
+            #         ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
+            #         pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
 
-                    # Search for detections
-                    if pi.shape[0]:
-                        # Prediction to target ious
-                        ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
+            #         # Search for detections
+            #         if pi.shape[0]:
+            #             # Prediction to target ious
+            #             ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
 
-                        # Append detections
-                        detected_set = set()
-                        for j in (ious > iouv[0]).nonzero(as_tuple=False):
-                            d = ti[i[j]]  # detected target
-                            if d.item() not in detected_set:
-                                detected_set.add(d.item())
-                                detected.append(d)
-                                correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
-                                if len(detected) == nl:  # all targets already located in image
-                                    break
+            #             # Append detections
+            #             detected_set = set()
+            #             for j in (ious > iouv[0]).nonzero(as_tuple=False):
+            #                 d = ti[i[j]]  # detected target
+            #                 if d.item() not in detected_set:
+            #                     detected_set.add(d.item())
+            #                     detected.append(d)
+            #                     correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
+            #                     if len(detected) == nl:  # all targets already located in image
+            #                         break
 
-            # Append statistics (correct, conf, pcls, tcls)
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
-
-        # Plot images
-        if plots and batch_i < 3:
-            f = save_dir / f'test_batch{batch_i}_labels.jpg'  # filename
-            plot_images(img, targets, paths, f, names)  # labels
-            f = save_dir / f'test_batch{batch_i}_pred.jpg'
-            plot_images(img, output_to_target(output, width, height), paths, f, names)  # predictions
+            # # Append statistics (correct, conf, pcls, tcls)
+            # stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+        
+    with open(f'pred_boxes@{opt.conf_thres}.json', 'w') as out_json:
+        json.dump(out_boxes, out_json)
+        # # Plot images
+        # if plots and batch_i < 3:
+        #     f = save_dir / f'test_batch{batch_i}_labels.jpg'  # filename
+        #     plot_images(img, targets, paths, f, names)  # labels
+        #     f = save_dir / f'test_batch{batch_i}_pred.jpg'
+        #     plot_images(img, output_to_target(output, width, height), paths, f, names)  # predictions
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
@@ -252,8 +273,8 @@ def test(data,
 
     # Print speeds
     t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
-    if not training:
-        print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
+    # if not training:
+    #     print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
 
     # Save JSON
     if save_json and len(jdict):
@@ -281,8 +302,8 @@ def test(data,
             print('ERROR: pycocotools unable to run: %s' % e)
 
     # Return results
-    if not training:
-        print('Results saved to %s' % save_dir)
+    # if not training:
+    #     print('Results saved to %s' % save_dir)
     model.float()  # for training
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
@@ -316,30 +337,16 @@ if __name__ == '__main__':
     opt.data = check_file(opt.data)  # check file
     print(opt)
 
-    if opt.task in ['val', 'test']:  # run normally
-        test(opt.data,
-             opt.weights,
-             opt.batch_size,
-             opt.img_size,
-             opt.conf_thres,
-             opt.iou_thres,
-             opt.save_json,
-             opt.single_cls,
-             opt.augment,
-             opt.verbose,
-             save_txt=opt.save_txt,
-             save_conf=opt.save_conf,
-             )
-
-    elif opt.task == 'study':  # run over a range of settings and save/plot
-        for weights in ['yolov4-pacsp.weights', 'yolov4-pacsp-x.weishts']:
-            f = 'study_%s_%s.txt' % (Path(opt.data).stem, Path(weights).stem)  # filename to save to
-            x = list(range(320, 800, 64))  # x axis
-            y = []  # y axis
-            for i in x:  # img-size
-                print('\nRunning %s point %s...' % (f, i))
-                r, _, t = test(opt.data, weights, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json)
-                y.append(r + t)  # results and times
-            np.savetxt(f, y, fmt='%10.4g')  # save
-        os.system('zip -r study.zip study_*.txt')
-        # utils.general.plot_study_txt(f, x)  # plot
+    test(opt.data,
+            opt.weights,
+            opt.batch_size,
+            opt.img_size,
+            opt.conf_thres,
+            opt.iou_thres,
+            opt.save_json,
+            opt.single_cls,
+            opt.augment,
+            opt.verbose,
+            save_txt=opt.save_txt,
+            save_conf=opt.save_conf,
+            )
